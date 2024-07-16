@@ -6,3 +6,8 @@ class JSONResponse(BaseModel):
     message: str
     data: dict | None
     errors: list[dict] | None
+
+
+class WebsocketResponse(BaseModel):
+    op: str
+    data: dict | None
