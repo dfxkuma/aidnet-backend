@@ -3,12 +3,11 @@ import jwt
 import uuid
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from typing import Annotated
 import redis.asyncio as redis
 
 from app.redispool import RedisPool
 
-from fastapi import APIRouter, HTTPException, Depends, status, Body
+from fastapi import APIRouter, HTTPException, Depends, status, Body, Request
 from fastapi_utils.cbv import cbv
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer
@@ -67,9 +66,7 @@ class User:
         await redis_pool.hdel("user", token)
 
     @staticmethod
-    async def get_current_user(
-        token: Annotated[str, Depends(oauth2_scheme)]
-    ) -> DatabaseUser:
+    async def get_current_user(token: str = Depends(oauth2_scheme)) -> DatabaseUser:
         credentials_exception = HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
@@ -79,12 +76,12 @@ class User:
             payload = jwt.decode(
                 token, os.environ["JWT_SECRET_KEY"], algorithms=["HS256"]
             )
-            user_id = str = payload.get("sub")
+            user_id: str = payload.get("sub")
             if user_id is None:
                 raise credentials_exception
         except InvalidTokenError:
             raise credentials_exception
-        user = await DatabaseUser.get(user_id=user_id)
+        user = await DatabaseUser.get(id=user_id)
         if user is None:
             raise credentials_exception
         return user
@@ -92,10 +89,13 @@ class User:
     @router.post("/register_code", description="인증 코드 생성하기")
     async def register_code(
         self,
-        current_user: Annotated[DatabaseUser, Depends(get_current_user)],
+        current_user: "DatabaseUser" = Depends(get_current_user),
         email: str = Body(...),
     ):
-        if UserBitflag.unzip(current_user.flags).has(UserFlag.CREATE_REGISTER_CODE):
+        current_user = await current_user
+        user_flag = UserBitflag.unzip(current_user.flags)
+        user_flag.add(UserFlag.CREATE_REGISTER_CODE)
+        if not user_flag.has(UserFlag.CREATE_REGISTER_CODE):
             raise HTTPException(status_code=403, detail="Permission denied")
 
         new_register_code = uuid.uuid4().hex[:6]
@@ -121,10 +121,15 @@ class User:
             raise HTTPException(status_code=400, detail="Username already exists")
         if await DatabaseUser.exists(email=user_data.email):
             raise HTTPException(status_code=400, detail="Email already exists")
-        if not await UserRegisterCode.exists(code=user_data.register_code):
+        find_register_code = await UserRegisterCode.exists(code=user_data.register_code)
+        if not find_register_code:
+            raise HTTPException(status_code=400, detail="Invalid register code")
+        if not user_data.register_code:
             raise HTTPException(status_code=400, detail="Invalid register code")
 
-        register_code_data = await UserRegisterCode.get(code=user_data.register_code)
+        register_code_data = await UserRegisterCode.filter(
+            code=user_data.register_code
+        ).first()
         if register_code_data.email != user_data.email:
             raise HTTPException(status_code=400, detail="Invalid register code")
 
@@ -149,9 +154,11 @@ class User:
     @router.post("/logout", description="로그아웃하기 (토큰 만료시키기)")
     async def logout(
         self,
-        current_user: Annotated[DatabaseUser, Depends(get_current_user)],
+        request: Request,
+        current_user: "DatabaseUser" = Depends(get_current_user),
     ):
-        session_user, token = current_user
+        _current_user = await current_user
+        token = request.headers["Authorization"].split(" ")[1]
         await self.delete_token(redis_pool=self.redis_pool, token=token)
         return JSONResponse(code=200, message="Logout successful")
 
@@ -191,4 +198,6 @@ class User:
                 errors=[],
             )
         except Exception as _e:
-            raise HTTPException(status_code=500, detail="Internal Server Error, " + str(_e))
+            raise HTTPException(
+                status_code=500, detail="Internal Server Error, " + str(_e)
+            )
